@@ -1,0 +1,25 @@
+{
+  "probability": {
+    "log_loss": 0.2452910896655872,
+    "brier": 0.0687760194488351,
+    "calibration_slope": 1.0359364800797324,
+    "calibration_intercept": 0.0685192592155309,
+    "top1_hit_rate": 0.28991060025542786,
+    "top3_hit_rate": 0.5951468710089399
+  },
+  "betting": {
+    "n_bets": 80,
+    "turnover_fraction": 0.024000000000000035,
+    "avg_edge": 0.4505425238001609,
+    "n_races": 784,
+    "races_with_bets": "8"
+  },
+  "bankroll": {
+    "final_no_rebate": 10010918.5,
+    "final_with_rebate": 10030979.0,
+    "roi_no_rebate": 0.0010918499999998943,
+    "roi_with_rebate": 0.0030978999999999868,
+    "avg_log_growth": 1.3919060782039175e-06,
+    "max_drawdown": 0.003
+  }
+}
