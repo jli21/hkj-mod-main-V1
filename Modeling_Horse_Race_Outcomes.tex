@@ -1,0 +1,759 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{xcolor}
+
+\setlength{\parskip}{6pt}
+\setlength{\parindent}{0pt}
+
+\title{Modeling Horse Race Outcomes --- HKJC}
+\author{Project Methodology \& Production Notes}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\tableofcontents
+\vspace{1em}
+
+% =============================================================================
+\section{Introduction}
+
+This document covers the full methodology of the HKJC horse-racing probability
+model, from first principles through the current production configuration. It
+unifies three strands of work:
+
+\begin{enumerate}\item \textbf{Modeling frameworks} --- binary logistic, exploded logit,
+      softmax, and the market-anchored \emph{Offset} model that is the
+      current production choice.
+\item \textbf{Feature engineering} --- the 25 features used in production,
+      why each is constructed the way it is, and what alternatives were
+      tested and rejected.
+\item \textbf{Betting \& results} --- Kelly bet sizing, bagging-based
+      variance reduction, and cumulative performance over 2015--2026
+      (including out-of-sample 2025 and partial 2026).
+\end{enumerate}
+
+The production recipe, in one line: \textbf{5-seed bagged Offset model
+with 25 features (including the \texttt{body\_wt\_mkt\_residual} feature),
+trained on all history prior to the test year, bet with Kelly
+fraction 0.02 on a \$10M bankroll}.
+
+Cumulative ROI over 2015--2026 at Kelly 0.02: \textbf{+332.5\% without
+rebate, +880.1\% with 10\% rebate on race-losses $\geq$ \$10k},
+with 9/12 and 11/12 positive years respectively.
+
+% =============================================================================
+\section{Horse Racing Context and HKJC Data}
+
+\subsection{Race Structure}
+Each race is classified by:
+\begin{itemize}\item \textbf{Distance} --- 1000m, 1200m, 1400m, 1600m, 1650m, 1800m,
+      2000m, 2200m. Distances vary by racecourse and day.
+\item \textbf{Surface} --- \emph{Turf} or \emph{AWT} (all-weather track).
+\item \textbf{Class tier} --- Class 1 (toughest) through Class 5, or Group races.
+      Class is handicap-rating-banded.
+\item \textbf{Racecourse} --- Sha Tin (ST, larger) or Happy Valley (HV,
+      tight 1.2km circumference).
+\end{itemize}
+
+\subsection{Variables used}
+For each horse in each race, HKJC publishes (pre- and post-race):
+\begin{itemize}\item Identity: \texttt{horse\_id}, trainer, jockey.
+\item Structural: \texttt{Draw} (stall position), \texttt{Act\_Wt} (weight carried),
+      \texttt{Declar.\ Horse\ Wt.} (declared body weight), \texttt{Gear}.
+\item Market: \texttt{Win Odds} (final). Implied probability
+      $p_{\text{implied}} = 1 / \text{odds}$.
+\item Outcome: \texttt{Pla.} (finish position), \texttt{Finish Time},
+      \texttt{Running Position} (positions at 3--6 intra-race sections).
+\end{itemize}
+
+Additional data we scrape separately:
+\begin{itemize}\item \textbf{Barrier trials} (pre-race gallops, 53k+ records).
+\item \textbf{Sectional times} (per-section times and positions, 648k rows).
+\item \textbf{Dividend information} for refunds and payout verification.
+\end{itemize}
+
+\subsection{Data hygiene}
+\begin{itemize}\item Refunded runners (\texttt{WV}, \texttt{WV-A}, \texttt{WX}, \texttt{WX-A}, \texttt{WXNR})
+      are dropped entirely.
+\item Void finishers (\texttt{PU}, \texttt{DNF}, \texttt{DISQ}, \texttt{UR}, \texttt{FE}, \texttt{TNP})
+      are coded 99 and excluded from training.
+\item Races with gappy or duplicated positions are removed pre-training
+      (see \texttt{remove\_tied\_entries}).
+\end{itemize}
+
+% =============================================================================
+\section{Data Representation and Notation}
+
+Each observation is indexed by $(\text{race\_id}, \text{horse\_id})$. Let
+$R$ = number of races, $m_r$ = field size of race $r$, and
+$N = \sum_r m_r$ = total observations.
+
+Feature matrix $X \in \mathbb{R}^{N\times p}$; for observation $i$,
+feature vector $x_i \in \mathbb{R}^p$ ($p = 25$ in production).
+
+Outcomes:
+\begin{itemize}\item Binary win indicator $y_i^{\text{win}} \in \{0,1\}$; exactly one horse per
+      race has $y^{\text{win}}=1$.
+\item Ordinal finish position $y_i^{\text{place}} \in \{1,\dots,m_r\}$.
+\end{itemize}
+
+% =============================================================================
+\section{Modeling Approaches}
+
+We developed three gradient-boosting objectives and evaluated a fourth
+architecture (Offset) that became production.
+
+\subsection{Binary Logistic-Loss Boosted Trees}
+
+Each horse treated as a separate binary example. Given $F(x_i) \in \mathbb{R}$,
+$p_i = \sigma(F(x_i))$ where $\sigma(z) = 1/(1+e^{-z})$.
+
+\[
+\mathcal{L}_{\text{logistic}}(F) \;=\; \sum_{i=1}^{N}
+  \Bigl[-y_i^{\text{win}}\log p_i \;-\; (1-y_i^{\text{win}})\log(1-p_i)\Bigr].
+\]
+
+Gradient / Hessian: $\partial\ell/\partial F = p_i - y_i$,
+$\partial^2\ell/\partial F^2 = p_i(1-p_i)$.
+
+Ensemble: $F_T(x) = \sum_{m=1}^{T} \nu\, h_m(x)$,
+each $h_m$ a regression tree of depth $\leq D$ trained on pseudo-residuals.
+
+Post-hoc calibration: \texttt{CalibratedClassifierCV} (isotonic) on an
+inner cross-validated fold, then per-race softmax normalization so
+probabilities sum to 1 within a race.
+
+\subsection{Exploded Logit (Plackett--Luce)}
+
+Models the full ranking of horses in a race. For race $r$ with
+latent scores $f_i = F(x_i)$ and true ranking positions $y_i^{\text{place}}$,
+the likelihood of the observed ordering is:
+
+\[
+\mathcal{L}_r = \prod_{k=1}^{K}
+  \frac{\exp(f_{\pi_k})}{\sum_{j \in \text{remaining at stage }k} \exp(f_j)}
+\]
+
+where $\pi_k$ is the horse in position $k$. With truncation at top-$n$
+(winner-only when $n=1$, top-3 when $n=3$, full ordering when $n=-1$).
+
+Negative log-likelihood, gradient, and Hessian are coded into a
+custom XGBoost/LightGBM objective (\texttt{exploded\_logit\_obj}).
+
+\subsection{Softmax (Winner-Only)}
+
+Equivalent to exploded logit with $n=1$: only the winner's relative
+probability is modeled. Trained with a custom softmax objective
+(\texttt{softmax\_obj}).
+
+Post-hoc calibration for softmax uses binned temperature scaling
+(per field-size bin, optionally per surface).
+
+\subsection{Offset Model (Production)}
+
+\textbf{This is the current production model.} Instead of learning
+the log-odds from scratch, the Offset model anchors predictions to the
+market and learns only the \emph{residual}.
+
+Let $\pi_i$ denote the normalized market implied probability for
+observation $i$. Define the market log-odds
+\[
+\eta_i^{\text{mkt}} = \operatorname{logit}(\pi_i) = \log\frac{\pi_i}{1-\pi_i}.
+\]
+
+We train a binary-logistic XGBoost with $\eta_i^{\text{mkt}}$ as a fixed
+\texttt{base\_margin}:
+\[
+p_i = \sigma\bigl(\eta_i^{\text{mkt}} + F(x_i)\bigr),
+\]
+where $F(\cdot)$ is the XGBoost ensemble. When $F(x_i)=0$, the model
+reproduces the market. XGBoost's rounds adjust only $F(x_i)$, the
+\emph{correction} to market.
+
+\paragraph{Why this helps.}
+\begin{enumerate}\item The market is an excellent calibrated probability estimator. Asking
+      the model to re-derive it from scratch wastes tree capacity.
+\item \textbf{Importance is evenly distributed across edge features}
+      (gain $\approx 4$--$6$) rather than concentrated on the market
+      anchor. This reveals which features are actually contributing
+      residual signal.
+\item Post-hoc isotonic calibration \emph{hurts} Offset --- the market
+      anchor is already calibrated; reshaping the output distorts it.
+      See Section \ref{sec:rejected}.
+\end{enumerate}
+
+\paragraph{Offset hyperparameters (deep\_slow, tuned).}
+\begin{itemize}\item \texttt{learning\_rate=0.01}, \texttt{max\_depth=5}
+\item \texttt{min\_child\_weight=20}
+\item \texttt{subsample=0.7}, \texttt{colsample\_bytree=0.7}
+\item \texttt{gamma=0.2}, \texttt{reg\_alpha=2.0}, \texttt{reg\_lambda=10.0}
+\item \texttt{rounds=400}
+\end{itemize}
+
+Depth 5 is deeper than typical softmax configs because the model only
+learns corrections --- deeper trees capture feature interactions without
+overfitting the market signal.
+
+% =============================================================================
+\section{Production Feature Set (25 Features)}
+
+All features are \emph{time-respecting}: any expanding / rolling
+statistic uses only past races (shift-by-1 or expanding-minus-current).
+
+\subsection{Market (2)}
+\begin{itemize}\item \texttt{Implied\_Prob} $= 1/\text{Win Odds}$, renormalized per race.
+\item \texttt{log\_implied\_prob} $= \log(\text{Implied\_Prob})$.
+\end{itemize}
+
+\subsection{Race card (4)}
+\begin{itemize}\item \texttt{Racecourse} --- ST=1, HV=0.
+\item \texttt{Track\_Turf} --- Turf=1, AWT=0.
+\item \texttt{Draw} --- stall number 1--14.
+\item \texttt{Act\_Wt} --- weight carried, lbs.
+\end{itemize}
+
+\subsection{Class \& Weight (3)}
+\begin{itemize}\item \texttt{class\_change} $= \text{prev\_class} - \text{current\_class}$.
+      The most important single feature by XGBoost gain (rank 1--2 nearly
+      every year). Captures difficulty-level change.
+\item \texttt{wt\_z} --- $z$-score of \texttt{Act\_Wt} within the current field.
+\item \texttt{setup\_weight\_z} --- $z$-score of \texttt{Act\_Wt} vs horse's own
+      expanding history of carried weights.
+\end{itemize}
+
+\subsection{Form features (4)}
+\begin{itemize}\item \texttt{recent\_form} $= \text{avg}(1/\text{place})$ over last 3 races.
+      Concave weighting: 1st $\to$ 1.0, 2nd $\to$ 0.5, 3rd $\to$ 0.33, tapering
+      for back-of-pack. Empirically outperforms linear normalization.
+\item \texttt{form\_vs\_career} = recent\_form $-$ career\_form. Trajectory signal.
+\item \texttt{career\_beat\_odds} --- expanding mean of
+      $(y_i^{\text{win}} - \pi_i)$ per horse. A per-horse market-residual.
+\item \texttt{prev\_win} --- binary: won last race.
+\end{itemize}
+
+\subsection{Trainer features (3)}
+\begin{itemize}\item \texttt{trainer\_track\_spec} --- trainer's win rate at this specific
+      racecourse minus trainer's overall win rate. Only applied with
+      min-runs thresholds (50 overall, 20 per track).
+\item \texttt{tt\_gap} --- trainer $\times$ track actual WR minus market-implied WR.
+\item \texttt{tr\_gap} --- trainer overall actual WR minus market-implied WR.
+\end{itemize}
+
+\subsection{Draw \& field interactions (2)}
+\begin{itemize}\item \texttt{draw\_outside\_ST} --- binary: \texttt{Draw} $\geq 10$ \textbf{and} \texttt{Racecourse}=ST.
+      Outside-draw penalty at Sha Tin (except ST 1000m straight, where it
+      reverses --- the tree learns the reversal from other features).
+\item \texttt{fav\_field\_size} = \texttt{is\_fav} $\times$ \texttt{field\_size}.
+      Captures the small-field favourite overpricing effect.
+\end{itemize}
+
+\subsection{Barrier trial features (2)}
+Market-orthogonal signals from pre-race gallops.
+\begin{itemize}\item \texttt{bt\_avg\_early} --- expanding average of
+      $\text{early\_pos}/\text{field\_size}$ in past barrier trials. Running-style signature.
+\item \texttt{bt\_last\_behind} --- time behind winner in the most recent
+      barrier trial.
+\end{itemize}
+
+\subsection{Sectional features (4)}
+Computed from per-horse-per-section times.
+\begin{itemize}\item \texttt{trail\_sect\_closing} --- avg closing speed vs race average
+      (last-section speed differential), trailed across past races.
+\item \texttt{trail\_sect\_peak\_at} --- average position (0=early, 1=late)
+      of horse's peak sectional speed. Running-style signature.
+\item \texttt{trail\_sect\_avg} --- overall sectional-speed deviation vs
+      race average.
+\item \texttt{trail\_sect\_best\_gain} --- biggest intra-race position gain
+      in one section, averaged across races. Explosive-move capability.
+\end{itemize}
+
+\subsection{Body weight residual (1)}
+\label{sec:body_wt_residual}
+
+The newest and most impactful feature added this session.
+
+\paragraph{Construction.} For each row, define
+\[
+\text{bucket} = (B_{\Delta w}, B_\pi),
+\]
+where $B_{\Delta w}$ bins $\text{body\_wt\_change}$ into
+$\{<\!-10, [-10,-5], [-5,+5], [+5,+10], >+10\}$ lbs, and $B_\pi$ bins
+\texttt{Implied\_Prob} into $\{<0.04, [0.04,0.08], [0.08,0.15], [0.15,0.25], >0.25\}$.
+That yields up to $5\times 5=25$ buckets.
+
+Time-respecting expanding statistics per bucket:
+\[
+\text{past\_wins}_i = \sum_{j<i,\ \text{bucket}(j)=\text{bucket}(i)} y_j^{\text{win}},
+\qquad
+\text{past\_implied}_i = \sum_{j<i,\ \text{bucket}(j)=\text{bucket}(i)} \pi_j.
+\]
+
+The feature is a shrunk residual:
+\[
+\texttt{body\_wt\_mkt\_residual}_i \;=\;
+\frac{\text{past\_wins}_i - \text{past\_implied}_i}{\text{past\_implied}_i + k},
+\qquad k=50.
+\]
+
+This is the \textbf{market-failure residual}: it measures, bucket by bucket,
+the historical deviation between actual wins and market-implied wins.
+Positive $\Rightarrow$ market systematically underprices this
+(body\_wt\_change $\times$ implied\_prob) combination; negative $\Rightarrow$
+systematically overprices.
+
+\paragraph{Empirical signal.} The strongest effects are:
+\begin{itemize}\item Favourites ($\pi > 0.15$) with moderate weight drops or gains:
+      +2 to +3\% edge.
+\item Horses after long rest ($>$60 days): weight \emph{gain} is positive
+      (horse stronger).
+\item Volatile-weight horses with big drops: +0.7\% edge.
+\item Previous winners with weight drops: +1.3\% edge.
+\end{itemize}
+
+\paragraph{Why this specifically succeeded.} Earlier sessions tried many
+``target market-failure residual'' features (e.g., draw-bias residual,
+class-change residual); most hurt. Two distinguishing factors for body
+weight:
+\begin{enumerate}\item \texttt{Declar.\ Horse\ Wt.} is nearly orthogonal to market
+      odds (correlation $\approx 0.01$). The market has minimal
+      pricing of body-weight dynamics.
+\item Effects are strongly non-monotonic and interaction-dependent
+      (different direction by implied-prob bucket). A single raw
+      feature cannot capture this; a bucketed residual can.
+\end{enumerate}
+
+Across 8 seeds: mean paired $\Delta = +34$pp cumulative ROI over the
+baseline, 7/8 seeds positive, minimum-case ROI compressed from
+$-33\%$ to $-3\%$.
+
+% =============================================================================
+\section{Architecture: 5-Seed Bagging}
+
+\subsection{Method}
+
+For each test year, train 5 independent Offset models with different
+XGBoost random seeds, $s \in \{7, 17, 42, 123, 256\}$. Each model sees the
+same data but makes different random choices in column subsampling,
+row subsampling, and split tie-breaking. Predictions are averaged:
+\[
+\hat p_i^{\text{bagged}} = \frac{1}{5} \sum_{s=1}^{5} \hat p_i^{(s)},
+\]
+then renormalized per race so probabilities sum to 1.
+
+\subsection{Effect}
+
+\begin{itemize}\item \textbf{Log-loss unchanged} (mean $\approx 0.2452$ across seeds and
+      bagged). Bagging does not improve prediction accuracy.
+\item \textbf{Prediction variance reduced} --- average per-horse
+      probability becomes more stable.
+\item \textbf{Kelly amplification of noise} drops --- bagged bet sizes
+      are more consistent race-to-race.
+\item Cumulative ROI in a 3-meta-seed test: mean $+71\%$ vs single-seed
+      mean $+49\%$ (over the 2015--2024 window). Min cum ROI across meta-seeds
+      went from $-3\%$ (single-seed) to $+41\%$ (bagged). \textbf{Downside
+      effectively eliminated.}
+\item Historically losing years 2018 and 2019 flipped from negative to
+      positive under bagging.
+\end{itemize}
+
+5 seeds is a good point on the diminishing-returns curve: further seeds
+add marginal stability at $5\times$ compute per additional set.
+
+% =============================================================================
+\section{Kelly Bet Sizing}
+
+\subsection{Multinomial Kelly}
+
+For a race with field size $m$, probabilities $p_1,\dots,p_m$
+(model), payoffs $b_1,\dots,b_m$ (decimal odds), Kelly maximises
+expected log-wealth:
+\[
+\max_{w_1,\dots,w_m \geq 0,\ \sum w_k \leq 1}\ \sum_k p_k \log\!\left(1 - \sum_j w_j + w_k b_k\right).
+\]
+
+In practice we scale the optimal fractions by $\alpha$
+(\emph{fractional Kelly}) to reduce variance:
+$w_k \to \alpha w_k$. Production uses $\alpha = 0.02$.
+
+Constraints in the \texttt{multinomial\_kelly} implementation:
+\begin{itemize}\item \texttt{max\_per\_horse} $= 15\%$ of bankroll.
+\item \texttt{max\_total} $= 30\%$ of bankroll per race.
+\item Minimum bet \$10; sub-minimum stakes are rounded up or dropped.
+\end{itemize}
+
+\subsection{Rebate}
+
+HKJC offers a rebate of 10\% on race-level losses at or above \$10k for
+high-volume players. The simulation reports \emph{both} trajectories:
+``without rebate'' (raw Kelly P\&L) and ``with rebate'' (adds
+$0.1 \times \max(0,\text{race\_loss} - 10{,}000)$ back to the bankroll
+at the end of each race where the condition triggers).
+
+\subsection{Kelly sweep}
+
+At Kelly fractions $\{0.01, 0.02, 0.03, 0.05\}$:
+
+\begin{center}
+\begin{tabular}{lrrrr}
+\toprule
+Metric & K=0.01 & K=0.02 & K=0.03 & K=0.05 \\
+\midrule
+Cum ROI (no rebate)   & +139.5\% & \textbf{+332.5\%} & +522.7\% & +644.8\% \\
+Cum ROI (with rebate) & +260.3\% & +880.1\%          & +2027.3\% & +5701.8\% \\
+Positive years (no rebate)   & 9/12 & \textbf{9/12} & 7/12 & 7/12 \\
+Positive years (with rebate) & 11/12 & \textbf{11/12} & 10/12 & 9/12 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Kelly 0.02 is the recommended production setting: 9/12 positive years
+without rebate, 11/12 with rebate, and the best Sharpe-like balance.
+Kelly 0.05 has higher mean but larger drawdowns in bad years.
+
+% =============================================================================
+\section{Feature-Engineering Methodology}
+\label{sec:methodology}
+
+This section captures the discipline that produced the current feature
+set and the design principles learned along the way.
+
+\subsection{Testing protocol}
+
+\begin{enumerate}\item \textbf{Empirical bucket analysis first.} Before proposing a new
+      feature encoding, measure the raw effect across buckets on
+      historical data. Look for:
+      \begin{itemize}
+        \item Effect size ($|\text{edge}| \geq 0.5\%$ is a minimum bar).
+        \item Year-by-year consistency (11+/14 years sameside is strong).
+        \item Non-monotonicity or bucket-specific direction.
+      \end{itemize}
+\item \textbf{Paired-delta test across $\geq 3$ seeds.} Single-seed ROI
+      differences are noise-dominated at the scale of single-feature
+      changes. Require:
+      \begin{itemize}
+        \item Mean paired $\Delta$ $>$ 0 with all seeds same-sign, OR
+        \item If mean is positive but some seeds negative, suspect
+              regression-to-the-mean on lucky seeds.
+      \end{itemize}
+\item \textbf{Log-loss as primary predictive metric.} LL is stable across
+      seeds (std $\sim 5\times 10^{-5}$); ROI is high-variance (std
+      $\sim 15$--$35\%$). If LL is unchanged, the feature doesn't
+      improve predictions --- ROI swing is Kelly amplification of noise.
+\item \textbf{Multi-year ROI as production-relevant metric.} LL is what
+      we're modeling, ROI is what we care about. Both must move to
+      declare a win.
+\end{enumerate}
+
+\subsection{Design principles}
+
+\begin{enumerate}\item \textbf{Target market-failure residuals, not market-known structure.}
+      The market already prices known effects (draw bias, class drops,
+      favourite-longshot). Encoding these as features duplicates
+      information already in the offset's \texttt{base\_margin} and adds
+      only noise.
+
+      \emph{Example failure:} \texttt{draw\_bias\_loc} was a time-respecting
+      bucketed lift feature for draw. Empirically accurate; in-model it
+      cost $-21$pp cumulative ROI because the market already knows.
+\item \textbf{Prune low-importance leaf features; preserve backbone
+      categoricals.} Low gain-importance can mean two things:
+      \begin{itemize}        \item Genuine dead weight (leaf feature with no interaction
+              role) --- safe to prune.
+        \item Backbone categorical (\texttt{Racecourse}, \texttt{Track\_Turf})
+              that enables \emph{other} features' interactions ---
+              dropping crashes the model.
+      \end{itemize}
+      Rule: if any other feature's computation or interaction depends
+      on this one, do not prune.
+\item \textbf{Don't re-encode top-importance features.} If a feature
+      consistently ranks 1--3 in gain, XGBoost has already found
+      optimal splits. Adding a derived version (e.g.,
+      \texttt{class\_change\_residual} built from \texttt{class\_change})
+      wastes tree capacity on correlated information.
+\item \textbf{Shape matters for form encodings.} \texttt{recent\_form}
+      using $1/\text{place}$ (concave, emphasising wins) outperforms
+      linear normalization by $(\text{field\_size} - \text{place} + 1)/\text{field\_size}$.
+      Horse quality is better signalled by top finishes than by
+      average position.
+\item \textbf{Re-engineering payoff is concentrated at mid-to-low
+      importance.} Top features are already optimal; dead features
+      are dead. The sweet spot for investment is features at gain-rank
+      5--15 that have known market-failure structure.
+\end{enumerate}
+
+\subsection{What was tried and rejected}
+\label{sec:rejected}
+
+Full list of re-engineering attempts that failed, saved here so future
+sessions don't repeat the work:
+
+\begin{enumerate}\item \texttt{draw\_bias\_loc}: bucketed draw-bias residual. $-21$pp.
+      \emph{Reason:} market already prices draw bias.
+\item \texttt{class\_change\_residual}: bucketed residual on
+      (current\_class $\times$ class\_change). $-38$pp across seeds.
+      \emph{Reason:} \texttt{class\_change} is already rank 1 in gain;
+      re-encoding adds overfitting surface without info.
+\item \texttt{prev\_mkt\_residual} swap for \texttt{prev\_win}: neutral
+      on LL, high-variance ROI. Mean $+9$pp but one seed crashed.
+      \emph{Kept \texttt{prev\_win} binary.}
+\item Form normalization $(\text{field\_size} - \text{place} + 1)/\text{field\_size}$
+      replacing $1/\text{place}$: $-32$pp.
+      \emph{Reason:} concave weighting of top finishes is the correct
+      shape.
+\item LOO on odds-dependent features (\texttt{fav\_field\_size},
+      \texttt{career\_beat\_odds}, \texttt{tt\_gap}, \texttt{tr\_gap}):
+      every removal hurt $-20$ to $-40$pp.
+\item Sectional consolidation (4 $\to$ 2 or 1): $-22$ to $-47$pp.
+      \emph{Reason:} all 4 features carry complementary information.
+\item Pruning \texttt{Racecourse} or \texttt{trail\_sect\_closing}: $-30$
+      to $-66$pp.
+      \emph{Reason:} backbone for downstream interactions.
+\item Isotonic post-hoc calibration on Offset: $-141$pp.
+      \emph{Reason:} market anchor via \texttt{base\_margin} is already
+      calibrated by construction; isotonic distorts the output.
+\item Softmax + isotonic calibration (with \texttt{log\_implied\_prob}):
+      $-91$pp.
+      \emph{Reason:} Softmax must learn the market anchor from scratch;
+      fundamentally weaker than hard-anchoring via base\_margin.
+\item Bagged Offset + Softmax ensemble (50/50): $-62$pp.
+      \emph{Reason:} blending a strong model with a weaker one yields a
+      mediocre model.
+\item Kelly $\alpha = 0.10$: catastrophic loss ($-92\%$ cumulative).
+      Volatility drag compounds across bad years.
+\item Adding raw body weight features (\texttt{body\_wt\_z} +
+      \texttt{body\_wt\_change}): $-54$pp. \emph{Only the bucketed
+      residual form works.}
+\item \texttt{body\_wt\_after\_win} targeted binary: $-48$pp. Too sparse.
+\end{enumerate}
+
+\subsection{What worked}
+
+\begin{enumerate}\item \textbf{Prune2} --- dropped \texttt{top3\_count\_5} and
+      \texttt{field\_form\_cv} (lowest-gain leaf features).
+      $+69$pp paired $\Delta$, 3/3 seeds positive.
+\item \textbf{\texttt{body\_wt\_mkt\_residual}} --- bucketed body-weight
+      market-failure residual (Section \ref{sec:body_wt_residual}).
+      $+34$pp paired $\Delta$ across 8 seeds.
+\item \textbf{5-seed bagging} --- averaging Offset predictions across
+      independent seeds. $+22$pp mean, downside compressed.
+\item \textbf{Higher Kelly safe with bagging} --- sweet spot shifted
+      from $0.01$--$0.02$ (single-seed) to $0.02$--$0.03$ (bagged).
+\end{enumerate}
+
+% =============================================================================
+\section{Implementation Details}
+
+\subsection{Preparing group pointers}
+
+XGBoost requires group sizes (one integer per race, giving the number
+of horses). Our helper \texttt{prepare\_group\_sizes(X)} produces this
+from a \texttt{MultiIndex}-ed DataFrame.
+
+\subsection{Handling ties and missing positions}
+
+For exploded-logit training, ties are broken by averaging the
+negative-gradient penalty across tied horses. Missing positions (void
+finishers) are excluded before any shift/expanding computation.
+
+\subsection{Time-respecting cross-validation}
+
+Production uses expanding-window temporal split: train years = all
+years strictly before the test year. No fold contains future data.
+Separate calibration year (the last train year) is carved out only
+when \texttt{--calibrate} is explicitly set; not used for Offset.
+
+% =============================================================================
+\section{Results: Year-by-Year (2015--2026)}
+
+\subsection{Market vs model log-loss}
+
+Model beats market log-loss 10 of 10 years in the original test
+(2015--2024), mean $\Delta$ = $-0.00089$ (excluding 2024 outlier: $-0.00047$).
+The absolute improvement is small ($\sim 0.2\%$ relative) but consistent.
+
+\subsection{Year-by-year ROI, Kelly 0.02}
+
+Bagged Offset, per-year reset to \$10M, across 12 test years:
+
+\begin{center}
+\begin{tabular}{lrr}
+\toprule
+Year & ROI no-rebate & ROI with-rebate \\
+\midrule
+2015 & +82.35\% & +106.97\% \\
+2016 & +68.03\% & +85.44\% \\
+2017 & +2.26\% & +11.46\% \\
+2018 & +0.21\% & +8.53\% \\
+2019 & +7.81\% & +15.65\% \\
+2020 & $-12.72\%$ & $-5.75\%$ \\
+2021 & +24.78\% & +33.27\% \\
+2022 & +12.72\% & +18.54\% \\
+2023 & +7.58\% & +12.75\% \\
+2024 & $-4.98\%$ & +1.49\% \\
+2025 & $-2.83\%$ & +0.94\% \\
+2026$^*$ & +4.77\% & +6.11\% \\
+\midrule
+Cumulative & +332.5\% & +880.1\% \\
+Positive years & 9/12 & 11/12 \\
+\bottomrule
+\end{tabular}
+\end{center}
+$^*$2026 is partial (approximately 2{,}500 races vs 9{,}000 full year).
+
+\subsection{Observations}
+
+\begin{itemize}\item \textbf{2015--2016} produced the bulk of the cumulative alpha.
+      Market LL in those years was low (market was sharp) --- the
+      model still beat it handily.
+\item \textbf{2020} is universally the worst year. Plausibly
+      COVID-related disruptions (empty stadiums, jockey pool changes,
+      betting-volume shift to online).
+\item \textbf{Recent years (2023--2025)} show smaller edges, consistent
+      with the ``market-efficiency edge decay'' hypothesis: as more
+      sophisticated bettors arbitrage the same signals, our
+      market-failure residuals shrink.
+\item \textbf{Out-of-sample 2025 and 2026}: slight no-rebate loss in
+      2025, positive in 2026 partial. Both positive with rebate. The
+      model appears to generalize to post-training periods.
+\end{itemize}
+
+% =============================================================================
+\section{Practical Concerns}
+
+\subsection{Edge decay over time}
+
+The market-failure features (\texttt{body\_wt\_mkt\_residual},
+\texttt{tt\_gap}, \texttt{tr\_gap}, \texttt{career\_beat\_odds}) are
+\emph{structural} residuals that automatically shrink as the market
+prices their content. The feature still computes correctly year-by-year
+(because it uses expanding history), but the magnitude of
+$\text{past\_wins} - \text{past\_implied}$ per bucket decreases, so
+Kelly bets smaller, so ROI shrinks.
+
+This is the structural reason 2015--2016 were outsized: the market had
+not yet priced certain patterns.
+
+\subsubsection*{Truncated-training experiment (tested, rejected)}
+
+To test whether the drift was severe enough to justify reducing the
+training window, we backtested three windows across 2015--2026 at
+three seeds:
+
+\begin{center}
+\begin{tabular}{lrrr}
+\toprule
+Window & Mean cum no-rebate & With rebate & Seeds no-rebate \\
+\midrule
+Full (2010--$t{-}1$) & \textbf{+103.34\%} & \textbf{+382.42\%} & +26.6\%, $-$18.9\%, +302.4\% \\
+Last 5 years & $-71.37\%$ & +18.26\% & $-$69.2\%, $-$72.7\%, $-$72.2\% \\
+Last 3 years & $-85.06\%$ & $-$1.42\%  & $-$67.2\%, $-$91.1\%, $-$96.9\% \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{Truncation catastrophically hurt overall.} Full history wins by
+a huge margin on cumulative ROI.
+
+However, the per-year breakdown shows \emph{recency-specific} gains
+hidden inside the global failure:
+\begin{itemize}\item 2024: last\_3 was $+7.92\%$ vs full $-4.46\%$ (flipped positive).
+\item 2025: last\_3 was $+21.00\%$ vs full $-7.03\%$ (large flip).
+\item 2026: last\_3 was $+3.12\%$ vs full $-0.30\%$ (flipped positive).
+\end{itemize}
+
+So the edge-decay story has \textbf{partial support}: very recent
+years DO benefit from a shorter training window. But the cumulative
+cost in 2015--2021 (where full history is massively better) dwarfs the
+recency gain.
+
+\subsubsection*{Implications for future work}
+
+\begin{itemize}\item Simple truncation is too aggressive. Too much signal lives in
+      older data.
+\item \textbf{Recency-weighted training} --- weight recent races more
+      ($w = \exp(-\lambda \cdot \text{years\_ago})$) without discarding
+      older data --- is the natural next attempt. Untested.
+\item \textbf{Full-plus-truncated ensemble} --- average predictions from
+      a full-history model and a last-3-year model. Untested.
+\item Regular re-screening of feature importance by year to catch
+      decaying features early.
+\end{itemize}
+
+\subsection{Rebate dependency}
+
+Before body\_wt + bagging: with-rebate was $+78\%$ vs no-rebate $+14\%$
+--- almost all the alpha came from rebate. After body\_wt + bagging:
+no-rebate cumulative is $+332.5\%$, with-rebate $+880.1\%$ --- alpha
+is genuine, rebate adds significant further compounding but isn't
+load-bearing.
+
+Critical for production: the strategy works without rebate, so is
+deployable for any player, though the tail compounds much higher with
+rebate.
+
+\subsection{Bet-time feature stability}
+
+Several features (\texttt{fav\_field\_size}, \texttt{career\_beat\_odds},
+\texttt{tt\_gap}, \texttt{tr\_gap}, \texttt{body\_wt\_mkt\_residual})
+depend on odds observed pre-race. At actual bet time, odds can shift
+due to late market flow. LOO tests showed every odds-dependent feature
+earns its keep, so we keep them despite the fragility risk; production
+deployment should re-run inference shortly before bet placement.
+
+\subsection{Strategic jockey behaviour}
+
+Several features assume independent race-to-race horse behavior
+(\texttt{career\_beat\_odds}, form aggregates). If connections
+strategically rest a horse's form for later, these backward-looking
+features miss the signal. We have no observable signal for this
+intentionality beyond \texttt{Gear} and \texttt{class\_change}.
+
+% =============================================================================
+\section{Reproducing the Pipeline}
+
+\paragraph{Step 1: Build the feature parquet.}
+\begin{verbatim}
+python data-processing/prep-data.py
+\end{verbatim}
+Loads raw CSVs and JSONs, merges horse history, computes all 25
+production features (including the body-weight market-failure residual),
+and writes \texttt{data/processed/race\_features.parquet}.
+
+\paragraph{Step 2: Run the production backtest + viz.}
+\begin{verbatim}
+python model/run_production.py
+\end{verbatim}
+Trains 5-seed bagged Offset for each test year 2015--2026, simulates
+Kelly ${0.01, 0.02, 0.03, 0.05}$ bankroll trajectories, and writes
+\texttt{model/results/bankroll\_viz.html} --- an interactive
+visualization with per-Kelly and per-year tabs.
+
+\paragraph{Streamlit UI.}
+\begin{verbatim}
+cd model && streamlit run app.py
+\end{verbatim}
+Defaults on the Training page are Offset + 5-seed bagging + the tuned
+deep\_slow hyperparameters. The Bankroll page defaults to Kelly 0.02
+and \$10M starting bankroll.
+
+% =============================================================================
+\section*{Appendix: Notation reference}
+
+\begin{tabular}{ll}
+$\pi_i$ & market implied probability for observation $i$ \\
+$\sigma(\cdot)$ & sigmoid function \\
+$F(x)$ & XGBoost ensemble output (log-odds correction in Offset) \\
+$\eta_i^{\text{mkt}}$ & $= \operatorname{logit}(\pi_i)$, market log-odds \\
+$y_i^{\text{win}}$ & binary win indicator \\
+$y_i^{\text{place}}$ & finish position \\
+$m_r$ & field size of race $r$ \\
+$N = \sum_r m_r$ & total observations \\
+$k$ & shrinkage prior for market-failure residuals (= 50) \\
+$\alpha$ & Kelly fraction \\
+\end{tabular}
+
+\end{document}
