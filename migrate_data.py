@@ -127,8 +127,13 @@ def migrate_aspx(dry_run=False):
 
         # Add race_id
         if "Date" in df.columns and "race_number" in df.columns:
-            df.insert(0, "race_id", df.apply(
-                lambda r: make_race_id(r["Date"], r["race_number"]), axis=1))
+            race_ids = df.apply(
+                lambda r: make_race_id(r["Date"], r["race_number"]), axis=1
+            )
+            if "race_id" in df.columns:
+                df["race_id"] = race_ids
+            else:
+                df.insert(0, "race_id", race_ids)
 
         # Extract entity IDs from links
         if "Horse_link" in df.columns:
@@ -186,8 +191,13 @@ def migrate_barrier_trials(dry_run=False):
 
         # Add race_id (using trial_number as the race equivalent)
         if "Date" in df.columns and "trial_number" in df.columns:
-            df.insert(0, "race_id", df.apply(
-                lambda r: make_race_id(r["Date"], r["trial_number"]), axis=1))
+            race_ids = df.apply(
+                lambda r: make_race_id(r["Date"], r["trial_number"]), axis=1
+            )
+            if "race_id" in df.columns:
+                df["race_id"] = race_ids
+            else:
+                df.insert(0, "race_id", race_ids)
 
         # Extract horse_id from Horse_link
         if "Horse_link" in df.columns:
