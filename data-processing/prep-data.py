@@ -255,6 +255,148 @@ def _match_barrier_trials(df: pd.DataFrame, bt: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# Sectional times feature extraction
+# ---------------------------------------------------------------------------
+def _load_sectional_times(st_dir: Path) -> pd.DataFrame:
+    """Load sectional times, compute per-horse-per-race summary features."""
+    print("Loading sectional times...")
+    frames = []
+    for f in sorted(st_dir.glob('sectional_times_*.csv')):
+        df = pd.read_csv(f, low_memory=False,
+                          usecols=['race_id', 'Date', 'horse_id', 'section_index',
+                                   'running_position', 'sectional_time_sec',
+                                   'race_sectional_time_sec', 'finish_place'])
+        frames.append(df)
+    if not frames:
+        return pd.DataFrame()
+
+    st = pd.concat(frames, ignore_index=True)
+    st['Date'] = pd.to_datetime(st['Date'], errors='coerce')
+    st['race_id'] = st['race_id'].astype(str)
+
+    # Horse's sectional time minus race average at same section
+    st['horse_vs_race'] = st['sectional_time_sec'] - st['race_sectional_time_sec']
+
+    # Per-horse-per-race summary
+    st_sorted = st.sort_values(['race_id', 'horse_id', 'section_index'])
+
+    def _horse_race_summary(g):
+        g = g.sort_values('section_index')
+        n = len(g)
+        if n < 2:
+            return None
+
+        vs_race = g['horse_vs_race'].values
+        positions = g['running_position'].values
+
+        # Closing speed: last section vs race (negative = closed fast)
+        closing_speed = vs_race[-1] if len(vs_race) > 0 else 0
+
+        # Early speed: first section vs race
+        early_speed = vs_race[0] if len(vs_race) > 0 else 0
+
+        # Best single-section time vs race (most negative = peak speed)
+        best_vs_race = np.min(vs_race) if len(vs_race) > 0 else 0
+
+        # When was the peak? 0=early, 1=late
+        peak_at = np.argmin(vs_race) / max(n - 1, 1) if len(vs_race) > 0 else 0.5
+
+        # Avg speed across all sections vs race
+        avg_vs_race = np.mean(vs_race) if len(vs_race) > 0 else 0
+
+        # Biggest position gain in one section
+        pos_deltas = np.diff(positions) if len(positions) > 1 else np.array([0])
+        best_gain = -np.min(pos_deltas) if len(pos_deltas) > 0 else 0
+
+        return pd.Series({
+            'sect_closing': closing_speed,
+            'sect_early': early_speed,
+            'sect_best': best_vs_race,
+            'sect_peak_at': peak_at,
+            'sect_avg': avg_vs_race,
+            'sect_best_gain': best_gain,
+            'race_date': g['Date'].iloc[0],
+        })
+
+    print(f"Computing per-horse-race sectional summaries ({len(st):,} rows)...")
+    summary = st_sorted.groupby(['race_id', 'horse_id']).apply(
+        _horse_race_summary, include_groups=False).dropna()
+    summary = summary.reset_index()
+    summary['race_date'] = pd.to_datetime(summary['race_date'])
+    print(f"  Sectional summaries: {len(summary):,}")
+    return summary
+
+
+def _match_sectionals(df: pd.DataFrame, sect: pd.DataFrame) -> pd.DataFrame:
+    """Compute trailing sectional features per horse (time-respecting)."""
+    if sect.empty:
+        for c in ['trail_sect_closing', 'trail_sect_peak_at', 'trail_sect_avg',
+                  'trail_sect_best_gain']:
+            df[c] = 0
+        print("  WARNING: No sectional data found")
+        return df
+
+    sect_sorted = sect.sort_values('race_date')
+
+    # Build lookup by horse
+    print("Building horse-level sectional lookup...")
+    sect_lookup = {}
+    for hid, grp in sect_sorted.groupby('horse_id'):
+        entries = []
+        # Running expanding averages
+        cum_closing = []
+        cum_peak = []
+        cum_avg = []
+        cum_gain = []
+        for _, row in grp.iterrows():
+            cum_closing.append(row['sect_closing'])
+            cum_peak.append(row['sect_peak_at'])
+            cum_avg.append(row['sect_avg'])
+            cum_gain.append(row['sect_best_gain'])
+            entries.append({
+                'date': row['race_date'],
+                'closing': np.mean(cum_closing),
+                'peak_at': np.mean(cum_peak),
+                'avg': np.mean(cum_avg),
+                'best_gain': np.mean(cum_gain),
+            })
+        sect_lookup[hid] = entries
+
+    df['trail_sect_closing'] = np.nan
+    df['trail_sect_peak_at'] = np.nan
+    df['trail_sect_avg'] = np.nan
+    df['trail_sect_best_gain'] = np.nan
+
+    matched = 0
+    for idx in df.index:
+        hid = df.loc[idx, 'horse_id'] if 'horse_id' in df.columns else None
+        if hid is None or hid not in sect_lookup:
+            continue
+        rd = df.loc[idx, 'r_date']
+        # Find most recent sectional strictly before race date
+        for entry in reversed(sect_lookup[hid]):
+            if pd.Timestamp(entry['date']) < rd:
+                df.loc[idx, 'trail_sect_closing'] = entry['closing']
+                df.loc[idx, 'trail_sect_peak_at'] = entry['peak_at']
+                df.loc[idx, 'trail_sect_avg'] = entry['avg']
+                df.loc[idx, 'trail_sect_best_gain'] = entry['best_gain']
+                matched += 1
+                break
+
+    df['trail_sect_closing'] = df['trail_sect_closing'].fillna(0)
+    df['trail_sect_peak_at'] = df['trail_sect_peak_at'].fillna(0.5)
+    df['trail_sect_avg'] = df['trail_sect_avg'].fillna(0)
+    df['trail_sect_best_gain'] = df['trail_sect_best_gain'].fillna(0)
+
+    print(f"  Sectionals matched: {matched:,} / {len(df):,} ({matched/len(df):.1%})")
+    print(f"  trail_sect_closing: mean={df['trail_sect_closing'].mean():.3f}")
+    print(f"  trail_sect_peak_at: mean={df['trail_sect_peak_at'].mean():.3f}")
+    print(f"  trail_sect_avg: mean={df['trail_sect_avg'].mean():.3f}")
+    print(f"  trail_sect_best_gain: mean={df['trail_sect_best_gain'].mean():.3f}")
+    return df
+
+
+# ---------------------------------------------------------------------------
 # Edge feature engineering (time-respecting)
 # ---------------------------------------------------------------------------
 def compute_edge_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -475,14 +617,25 @@ def compute_edge_features(df: pd.DataFrame) -> pd.DataFrame:
     df['prev_date'] = horse['r_date'].shift(1)
     df['days_since'] = (df['r_date'] - df['prev_date']).dt.days.fillna(30)
 
-    # TRAINER MOVES
-    df['prev_jockey'] = horse['Jockey'].shift(1)
-    df['trainer_moves'] = (
-        (df['class_change'] > 0).astype(float) +
-        (df['Act_Wt'] < df['prev_wt'] - 2).astype(float) +
-        (df['Jockey'] != df['prev_jockey']).astype(float).fillna(0)
+    # SETUP WEIGHT Z — is horse lighter than its own history?
+    # +4.6% spread at 1-3 (12/15), +1.1% at 3-6 (12/15), +0.9% at 10-20 (9/15)
+    # Replaces trainer_moves (crude count)
+    df['_horse_avg_wt'] = (
+        horse['Act_Wt'].expanding(min_periods=1).mean()
+        .reset_index(level=0, drop=True)
     )
-    df['trainer_moves'] = df['trainer_moves'].fillna(0)
+    df['_horse_avg_wt_shifted'] = horse['_horse_avg_wt'].shift(1)
+    df['_horse_std_wt'] = (
+        horse['Act_Wt'].expanding(min_periods=2).std()
+        .reset_index(level=0, drop=True)
+    )
+    df['_horse_std_wt_shifted'] = horse['_horse_std_wt'].shift(1).fillna(3)
+    df['setup_weight_z'] = (
+        (df['_horse_avg_wt_shifted'] - df['Act_Wt']) /
+        df['_horse_std_wt_shifted'].clip(lower=1)
+    )
+    df['setup_weight_z'] = df['setup_weight_z'].fillna(0)
+    df.drop(columns=[c for c in df.columns if c.startswith('_horse_')], inplace=True)
 
     # CAREER BEAT ODDS
     df['_beat_odds'] = (df['y.status_place'] == 1).astype(float) - df['Implied_Prob']
@@ -496,7 +649,7 @@ def compute_edge_features(df: pd.DataFrame) -> pd.DataFrame:
     print(f"  prev_win: {df['prev_win'].sum():,}")
     print(f"  top3_count_5: mean={df['top3_count_5'].mean():.2f}")
     print(f"  fav_field_size: favs={df['is_fav'].sum():,}")
-    print(f"  trainer_moves: non-zero={(df['trainer_moves'] > 0).sum():,}")
+    print(f"  setup_weight_z: mean={df['setup_weight_z'].mean():.4f}, std={df['setup_weight_z'].std():.4f}")
     print(f"  career_beat_odds: non-zero={(df['career_beat_odds'] != 0).sum():,}, "
           f"mean={df['career_beat_odds'].mean():.5f}")
     print(f"  days_since: mean={df['days_since'].mean():.1f}")
@@ -516,6 +669,69 @@ def compute_edge_features(df: pd.DataFrame) -> pd.DataFrame:
         print("  WARNING: No barrier trial data found")
 
     # ------------------------------------------------------------------
+    # 13. SECTIONAL TIMES FEATURES (trailing per horse)
+    # ------------------------------------------------------------------
+    st_dir = _here / '..' / 'data' / 'historical-data' / 'sectional-times'
+    if st_dir.exists():
+        print("\n  Loading sectional times data...")
+        sect = _load_sectional_times(st_dir)
+        df = _match_sectionals(df, sect)
+    else:
+        df['trail_sect_closing'] = 0
+        df['trail_sect_peak_at'] = 0.5
+        df['trail_sect_avg'] = 0
+        df['trail_sect_best_gain'] = 0
+        print("  WARNING: No sectional times data found")
+
+    # ------------------------------------------------------------------
+    # 14. BODY WEIGHT FEATURES (from Declar. Horse Wt.)
+    #     Builds body_wt_change + market-failure residual bucketed by
+    #     (body_wt_change × Implied_Prob). Residual is the production feature.
+    # ------------------------------------------------------------------
+    if 'Declar. Horse Wt.' in df.columns and df['Declar. Horse Wt.'].notna().any():
+        print("\n  Computing body weight features...")
+        df['body_wt_raw'] = df['Declar. Horse Wt.']
+        # Per-horse change (time-respecting via shift)
+        df['body_wt_change'] = (
+            df['body_wt_raw'] - horse['body_wt_raw'].shift(1)
+        ).fillna(0)
+
+        # Market-failure residual, bucketed by (body_wt_change × Implied_Prob).
+        # Time-respecting expanding: (past_wins − past_implied) / (past_implied + k)
+        wc_bins = [-10000, -10, -5, 5, 10, 10000]
+        wc_labels = ['wc_hd', 'wc_md', 'wc_flat', 'wc_mg', 'wc_hg']
+        impl_bins = [0, 0.04, 0.08, 0.15, 0.25, 1.01]
+        impl_labels = ['i_long', 'i_medl', 'i_mid', 'i_fav', 'i_vfav']
+
+        _wc = pd.cut(df['body_wt_change'], bins=wc_bins, labels=wc_labels)
+        _impl = pd.cut(df['Implied_Prob'], bins=impl_bins, labels=impl_labels)
+        df['_bwt_bucket'] = _wc.astype(str) + '|' + _impl.astype(str)
+        df['_bwt_win'] = (df['y.status_place'] == 1).astype(float)
+
+        # Sort by date for time-respecting expanding sums
+        df_sorted = df.sort_values('r_date')
+        stat_rows = df_sorted.loc[df_sorted['y.status_place'] != 99].copy()
+        grp = stat_rows.groupby('_bwt_bucket', sort=False)
+        cum_wins_past = grp['_bwt_win'].cumsum() - stat_rows['_bwt_win']
+        cum_impl_past = grp['Implied_Prob'].cumsum() - stat_rows['Implied_Prob']
+        k = 50.0
+        residual = (cum_wins_past - cum_impl_past) / (cum_impl_past + k)
+
+        df['body_wt_mkt_residual'] = 0.0
+        df.loc[residual.index, 'body_wt_mkt_residual'] = residual.values
+        df['body_wt_mkt_residual'] = df['body_wt_mkt_residual'].fillna(0)
+
+        df.drop(columns=['_bwt_bucket', '_bwt_win'], inplace=True)
+        print(f"  body_wt_mkt_residual: mean={df['body_wt_mkt_residual'].mean():+.5f}, "
+              f"std={df['body_wt_mkt_residual'].std():.4f}, "
+              f"corr(impl)={df['body_wt_mkt_residual'].corr(df['Implied_Prob']):+.4f}")
+    else:
+        df['body_wt_raw'] = np.nan
+        df['body_wt_change'] = 0
+        df['body_wt_mkt_residual'] = 0
+        print("  WARNING: No Declar. Horse Wt. column available")
+
+    # ------------------------------------------------------------------
     # Clean up
     # ------------------------------------------------------------------
     for c in ['prev_class', 'prev_wt', 'prev_odds', 'prev_going', 'prev_date',
@@ -525,17 +741,21 @@ def compute_edge_features(df: pd.DataFrame) -> pd.DataFrame:
 
     df.sort_index(inplace=True)
 
-    # PRUNED: dropped weight_change, days_since, draw_inside_HV,
-    #         class_drop_odds_stable, bt_recent_behind (marginal/redundant)
+    # Current production feature set (prune2 + body_wt_mkt_residual)
+    # PRUNED in prior refactor: weight_change, days_since, draw_inside_HV,
+    #   class_drop_odds_stable, bt_recent_behind, top3_count_5, field_form_cv.
+    # top3_count_5 and field_form_cv computed above but excluded from edge_cols.
     edge_cols = ['class_change',
                  'wt_z', 'recent_form',
                  'trainer_track_spec',
                  'draw_outside_ST',
-                 'top3_count_5', 'prev_win', 'fav_field_size',
+                 'prev_win', 'fav_field_size',
                  'form_vs_career',
-                 'trainer_moves', 'career_beat_odds',
-                 'field_form_cv',
-                 'bt_avg_early', 'bt_last_behind']
+                 'setup_weight_z', 'career_beat_odds',
+                 'bt_avg_early', 'bt_last_behind',
+                 'trail_sect_closing', 'trail_sect_peak_at',
+                 'trail_sect_avg', 'trail_sect_best_gain',
+                 'body_wt_mkt_residual']
     print(f"\nEdge features computed ({len(edge_cols)}): {', '.join(edge_cols)}")
     return df
 
@@ -759,16 +979,19 @@ if __name__ == '__main__':
     print("=" * 80)
     base = compute_edge_features(base)
 
+    # Current production feature set (prune2 + body_wt_mkt_residual = 19 edge)
     edge_feature_cols = [
         'class_change',
         'wt_z', 'recent_form',
         'trainer_track_spec', 'tt_gap', 'tr_gap',
         'draw_outside_ST',
-        'top3_count_5', 'prev_win', 'fav_field_size',
+        'prev_win', 'fav_field_size',
         'form_vs_career',
-        'trainer_moves', 'career_beat_odds',
-        'field_form_cv',
+        'setup_weight_z', 'career_beat_odds',
         'bt_avg_early', 'bt_last_behind',
+        'trail_sect_closing', 'trail_sect_peak_at',
+        'trail_sect_avg', 'trail_sect_best_gain',
+        'body_wt_mkt_residual',
     ]
 
     # Save base features
