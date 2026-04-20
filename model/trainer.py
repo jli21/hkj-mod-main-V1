@@ -110,6 +110,10 @@ def main():
     parser.add_argument('--use_blups', action='store_true', help="Use BLUP features")
     parser.add_argument('--market_baseline', action='store_true', help="Also generate M0 market-only baseline")
     parser.add_argument('--calibrate', action='store_true', help="Apply isotonic calibration (uses last training year as calibration set)")
+    parser.add_argument('--bag_seeds', type=str, default="",
+                        help="Comma-separated seeds for Offset bagging, e.g. '7,17,42,123,256'. "
+                             "When set, trains one Offset per seed and averages predictions. "
+                             "Applies only to Offset model.")
 
     args = parser.parse_args()
 
@@ -184,20 +188,42 @@ def main():
         print(f"Training: {model_type}")
         print("=" * 60)
 
+        bag_seeds_list = [int(s) for s in args.bag_seeds.split(',') if s.strip()]
+        use_bagging = (model_type == "Offset" and len(bag_seeds_list) > 1)
+
         if model_type == "Exploded Logit":
             model = ExplodedLogit(cv=args.cv_folds, backend='xgboost', params=xgb_params_dict, rounds=args.rounds, top_n=args.top_n)
+            model.fit(X_train, Y_train)
+            result_df = model.predict_proba(X_test)
         elif model_type == "Softmax":
             model = SoftmaxModel(cv=args.cv_folds, backend='xgboost', params=xgb_params_dict, rounds=args.rounds)
+            model.fit(X_train, Y_train)
+            result_df = model.predict_proba(X_test)
         elif model_type == "Offset":
-            # Offset model uses its own tuned defaults; only pass seed/nthread from user params
-            offset_overrides = {k: v for k, v in xgb_params_dict.items()
-                                if k in ('seed', 'nthread', 'tree_method', 'device')}
-            model = OffsetModel(backend='xgboost', params=offset_overrides, rounds=400)
+            # Pass ALL user-supplied XGBoost params to OffsetModel (they override its defaults).
+            # Defaults in the Streamlit UI match OffsetModel.DEFAULT_PARAMS so the user sees
+            # the same values that will be used.
+            if use_bagging:
+                # Train one Offset per seed, average predictions, renormalize per race.
+                # `model` = last-trained so imp_df / booster exist for downstream artifact saving.
+                preds_list = []
+                for seed in bag_seeds_list:
+                    print(f"  Bagging seed={seed}...")
+                    seed_params = {**xgb_params_dict, 'seed': seed}
+                    m = OffsetModel(backend='xgboost', params=seed_params, rounds=args.rounds)
+                    m.fit(X_train, Y_train)
+                    preds_list.append(m.predict_proba(X_test)['Y_prob'])
+                    model = m
+                stacked = pd.concat(preds_list, axis=1)
+                bagged = stacked.mean(axis=1)
+                bagged = bagged / bagged.groupby(level=0).transform('sum')
+                result_df = pd.DataFrame({'Y_prob': bagged})
+            else:
+                model = OffsetModel(backend='xgboost', params=xgb_params_dict, rounds=args.rounds)
+                model.fit(X_train, Y_train)
+                result_df = model.predict_proba(X_test)
         else:
             raise ValueError(f"Unknown model: {model_type}")
-
-        model.fit(X_train, Y_train)
-        result_df = model.predict_proba(X_test)
 
         # ── Isotonic calibration ──
         if args.calibrate and len(train_years_list) >= 2:

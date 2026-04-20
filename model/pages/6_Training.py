@@ -43,13 +43,16 @@ tab_split, tab_params, tab_features = st.tabs(["Train/Test Split", "Hyperparamet
 with tab_split:
     col_l, col_r = st.columns(2)
     with col_l:
-        years = list(range(2010, 2026))
+        years = list(range(2010, int(years_available[-1]) + 1))
         train_year_range = st.slider(
             "Training Years", min_value=years[0], max_value=years[-1],
-            value=(2016, 2023), key="train_years",
+            value=(2010, 2024), key="train_years",
+            help="Production default: 2010 through (test_year − 1).",
         )
         train_years = list(range(train_year_range[0], train_year_range[1] + 1))
     with col_r:
+        # Production default: test on the most recent year available in the data
+        default_test = years[-1] if years[-1] not in train_years else years[-1]
         test_year = st.selectbox("Test Year", years, index=len(years) - 1, key="test_year")
         if test_year in train_years:
             st.warning("Overlap between train and test years.")
@@ -65,19 +68,21 @@ with tab_split:
         st.caption(f"Test: {test_count:,} rows")
 
 with tab_params:
+    st.caption("Defaults below are the Offset `deep_slow` config from FINDINGS.md. "
+               "Softmax/Exploded Logit typically use lr=0.02, depth=4, reg_lambda=5.0, rounds=300.")
     col_a, col_b, col_c = st.columns(3)
     with col_a:
-        learning_rate = st.number_input("Learning Rate", 0.01, 0.1, 0.02, step=0.01, key="lr")
-        max_depth = st.slider("Max Depth", 3, 10, 4, key="max_depth")
+        learning_rate = st.number_input("Learning Rate", 0.005, 0.1, 0.01, step=0.005, format="%.3f", key="lr")
+        max_depth = st.slider("Max Depth", 3, 10, 5, key="max_depth")
         min_child_weight = st.number_input("Min Child Weight", 1, 50, 20, key="mcw")
     with col_b:
-        subsample = st.slider("Subsample", 0.5, 1.0, 0.8, step=0.1, key="subsample")
-        colsample_bytree = st.slider("Col Sample", 0.5, 1.0, 0.8, step=0.1, key="colsample")
-        gamma = st.number_input("Gamma", 0.0, 5.0, 0.1, step=0.1, key="gamma")
+        subsample = st.slider("Subsample", 0.5, 1.0, 0.7, step=0.1, key="subsample")
+        colsample_bytree = st.slider("Col Sample", 0.5, 1.0, 0.7, step=0.1, key="colsample")
+        gamma = st.number_input("Gamma", 0.0, 5.0, 0.2, step=0.1, key="gamma")
     with col_c:
-        reg_alpha = st.number_input("Reg Alpha (L1)", 0.0, 5.0, 1.0, step=0.1, key="reg_alpha")
-        reg_lambda = st.number_input("Reg Lambda (L2)", 0.0, 10.0, 5.0, step=0.5, key="reg_lambda")
-        rounds = st.number_input("Boosting Rounds", 50, 500, 300, step=10, key="rounds")
+        reg_alpha = st.number_input("Reg Alpha (L1)", 0.0, 5.0, 2.0, step=0.1, key="reg_alpha")
+        reg_lambda = st.number_input("Reg Lambda (L2)", 0.0, 20.0, 10.0, step=0.5, key="reg_lambda")
+        rounds = st.number_input("Boosting Rounds", 50, 1000, 400, step=10, key="rounds")
         cv_folds = st.slider("CV Folds", 3, 20, 3, key="cv_folds")
 
 with tab_features:
@@ -85,8 +90,10 @@ with tab_features:
     with col_fl:
         include_market = st.checkbox("Include market features", value=True, key="train_include_market")
         run_market_baseline = st.checkbox("Run M0 market baseline", value=True, key="train_market_baseline")
-        calibrate = st.checkbox("Isotonic calibration", value=True, key="train_calibrate",
-                                help="Post-hoc calibration using last training year. Improves probability accuracy.")
+        calibrate = st.checkbox("Isotonic calibration", value=False, key="train_calibrate",
+                                help="Post-hoc isotonic calibration using last training year. "
+                                     "LEAVE OFF for Offset — the market anchor already calibrates the output. "
+                                     "Use for Softmax/Exploded Logit only.")
     with col_fr:
         feature_cols = [c for c in train_data.columns if c not in NON_FEATURE_COLS]
         excluded_cols = st.multiselect(
@@ -106,13 +113,19 @@ with tab_features:
 # ---------------------------------------------------------------------------
 st.subheader("Run")
 
-col_model, col_topn, col_run = st.columns([2, 1, 1])
+col_model, col_bag, col_topn, col_run = st.columns([2, 1, 1, 1])
 with col_model:
     models = ["Exploded Logit", "Softmax", "Offset"]
-    selected_models = st.multiselect("Models", models, default=["Softmax"], key="selected_models")
+    selected_models = st.multiselect("Models", models, default=["Offset"], key="selected_models",
+                                     help="Production default: Offset (deep_slow, market as base_margin).")
     if "Offset" in selected_models:
-        st.info("Offset model uses its own tuned params (lr=0.01, depth=5, L2=10, 400 rounds). "
-                "Hyperparameter sliders above apply to Softmax/Exploded Logit only.")
+        st.info("Offset uses the Hyperparameters tab values directly. "
+                "Defaults match the tuned `deep_slow` config (lr=0.01, depth=5, L2=10, 400 rounds).")
+with col_bag:
+    bag_seeds_5 = st.checkbox("5-seed bagging", value=True, key="train_bag",
+                              help="Average predictions from 5 Offset models with seeds "
+                                   "[7, 17, 42, 123, 256]. Reduces Kelly amplification noise. "
+                                   "Offset models only.")
 with col_topn:
     top_n = st.number_input("Top-n (Exploded, -1=full)", -1, 10, -1, step=1, key="top_n")
 with col_run:
@@ -163,6 +176,8 @@ if run_button:
             cmd.append('--market_baseline')
         if calibrate:
             cmd.append('--calibrate')
+        if bag_seeds_5 and "Offset" in selected_models:
+            cmd.extend(['--bag_seeds', '7,17,42,123,256'])
 
         output_area = st.empty()
         output_area.text("Starting training...")

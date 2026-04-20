@@ -100,13 +100,15 @@ else:
         col_a, col_b = st.columns(2)
         with col_a:
             alpha = st.number_input(
-                "Kelly Fraction (alpha)", 0.01, 1.0, 0.10,
+                "Kelly Fraction (alpha)", 0.01, 1.0, 0.02,
                 step=0.01, key=f"alpha_{prefix}",
+                help="Production default: 0.02 (best consistency/return tradeoff; see FINDINGS.md).",
             )
         with col_b:
             initial_bankroll = st.number_input(
-                "Initial Bankroll (HKD)", 10_000, 100_000_000, 1_000_000,
+                "Initial Bankroll (HKD)", 10_000, 100_000_000, 10_000_000,
                 step=100_000, key=f"bankroll_{prefix}",
+                help="Production default: $10M (used in all backtests).",
             )
 
         race_df, bet_df, bw, br, result_df = _cached_simulation(
