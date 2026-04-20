@@ -729,7 +729,7 @@ if __name__ == '__main__':
     historical_dir = os.path.join(data_dir, "historical-data")
     processed_dir = os.path.join(data_dir, "processed")
 
-    years = range(2010, 2025)
+    years = range(2010, 2027)
 
     # Load horse history (post-migration: keyed by horse_id, ISO dates)
     horses_dir = os.path.join(historical_dir, "horses")

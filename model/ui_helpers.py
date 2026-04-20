@@ -81,7 +81,7 @@ def load_extended_data():
 
 
 @st.cache_data(show_spinner="Loading raw race data...")
-def load_raw_aspx_summary(years=range(2010, 2025)):
+def load_raw_aspx_summary(years=range(2010, 2027)):
     """Load raw ASPX results and compute summary statistics."""
     dfs = []
     for year in years:

@@ -55,7 +55,7 @@ def extract_horse_id(url):
     """Extract HorseId from HKJC URL, e.g. HK_2022_H170."""
     if not isinstance(url, str):
         return None
-    m = re.search(r"HorseId=([A-Za-z0-9_]+)", url)
+    m = re.search(r"horseid=([A-Za-z0-9_]+)", url, flags=re.IGNORECASE)
     return m.group(1) if m else None
 
 
@@ -63,7 +63,7 @@ def extract_jockey_id(url):
     """Extract JockeyId from HKJC URL, e.g. WEC."""
     if not isinstance(url, str):
         return None
-    m = re.search(r"JockeyId=([A-Za-z0-9_]+)", url)
+    m = re.search(r"jockeyid=([A-Za-z0-9_]+)", url, flags=re.IGNORECASE)
     return m.group(1) if m else None
 
 
@@ -71,7 +71,7 @@ def extract_trainer_id(url):
     """Extract TrainerId from HKJC URL, e.g. YTP."""
     if not isinstance(url, str):
         return None
-    m = re.search(r"TrainerId=([A-Za-z0-9_]+)", url)
+    m = re.search(r"trainerid=([A-Za-z0-9_]+)", url, flags=re.IGNORECASE)
     return m.group(1) if m else None
 
 
@@ -240,6 +240,8 @@ def migrate_dividends(dry_run=False):
             print(f"    Wrote {len(df)} rows to {out_name}")
             # Keep original JSON as backup
             backup = f.with_suffix(".json.bak")
+            if backup.exists():
+                backup.unlink()
             f.rename(backup)
             print(f"    Backed up original to {backup.name}")
 
