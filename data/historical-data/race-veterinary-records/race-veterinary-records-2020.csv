@@ -1,0 +1,5 @@
+race_id,Date,race_number,Racecourse,Horse No.,Horse,horse_id,record_date,Details,Passed On,source_url,scrape_ts
+2020092704,2020-09-27,4,ST,6,SUPER HONG KONG (D241),HK_2019_D241,2020-09-27,Substantial mucus in trachea after racing.,,,2026-04-26T06:45:03Z
+2020110804,2020-11-08,4,HV,5,HARMONY N BLESSED (E061),HK_2020_E061,2020-11-08,"After being loaded became fractious, reared, struck its head on the front gates, resulting in front gates opening and the horse exiting the barrier. Withdrawn from race.",2020-11-13,,2026-04-26T06:45:03Z
+2020112202,2020-11-22,2,ST,8,HARMONY N BLESSED (E061),HK_2020_E061,2020-11-08,"After being loaded became fractious, reared, struck its head on the front gates, resulting in front gates opening and the horse exiting the barrier. Withdrawn from race.",2020-11-13,,2026-04-26T06:45:03Z
+2020120908,2020-12-09,8,HV,12,HARMONY N BLESSED (E061),HK_2020_E061,2020-11-08,"After being loaded became fractious, reared, struck its head on the front gates, resulting in front gates opening and the horse exiting the barrier. Withdrawn from race.",2020-11-13,,2026-04-26T06:45:03Z
