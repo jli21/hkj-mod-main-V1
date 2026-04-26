@@ -18,7 +18,7 @@ This folder now contains a mix of direct HKJC scrapes and reconstructed historic
 - `race-incidents/`
   - Direct `racereportfull` scrape for `2000-2026`
 - `comments-on-running/`
-  - Currently backfilled for `2000`, `2025`, and `2026`
+  - Direct `corunning` scrape backfilled for `2000-2026`
 - `horse-movement-records/horse-movement-records.csv`
   - Direct `movementrecords` scrape for the recent `2025-2026` runner universe
 - `horse-trackwork-records/`
@@ -48,7 +48,6 @@ These pages do not reliably return historical meeting content from HKJC for past
 - Direct historical `formline` HTML is not reliably available for old meetings
 - Direct historical race-day `veterinaryrecord` HTML is not reliably available for old meetings
 - Older horse `movementrecords`, `trackworkresult`, and `ovehorse` pages are often empty or only useful for recent/active horses
-- `comments-on-running/` has not yet been backfilled for every year between `2001-2024`
 
 ## Practical Interpretation
 
